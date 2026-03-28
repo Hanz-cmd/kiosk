@@ -378,10 +378,13 @@ function handleVoice(t) {
 
 // ═══ COMPUTER VISION ENGINE (MEDIAPIPE) ═══
 let faceMesh = null;
+let hands = null;
 let camera = null;
 let cvInitialized = false;
+let activeTrackingMode = 'face';
+let pinchLockout = false;
 
-// We need smoothing for the nose pointer
+// We need smoothing for the nose/hand pointer
 let smoothedX = window.innerWidth / 2;
 let smoothedY = window.innerHeight / 2;
 const EMA_ALPHA = 0.3; // Smoothing factor
@@ -395,6 +398,76 @@ const FACE_WAKE_MS = 4000;
 document.addEventListener('mousemove', () => touchActive = true);
 document.addEventListener('touchstart', () => touchActive = true);
 document.addEventListener('click', () => touchActive = true);
+
+// ══ ENGINE LOGIC ══
+let edgeScrollTimer = null;
+let edgeScrollInterval = null;
+let currentEdge = null; // 'top' or 'bottom'
+
+function handleEdgeScrolling(y) {
+  const topEdge = window.innerHeight * 0.15;
+  const bottomEdge = window.innerHeight * 0.85;
+  
+  let targetEdge = null;
+  if (y > bottomEdge) targetEdge = 'bottom';
+  else if (y < topEdge) targetEdge = 'top';
+  
+  if (targetEdge) {
+    if (currentEdge !== targetEdge) {
+      currentEdge = targetEdge;
+      clearTimeout(edgeScrollTimer);
+      clearInterval(edgeScrollInterval);
+      
+      // Start scrolling after 3s dwell
+      edgeScrollTimer = setTimeout(() => {
+        edgeScrollInterval = setInterval(() => {
+          const els = [window, document.documentElement, document.body, document.querySelector('.kiosk-body'), document.querySelector('.kiosk-wrap')];
+          els.forEach(el => { 
+            try { 
+              if(el) el.scrollBy({ top: targetEdge === 'bottom' ? 8 : -8, left: 0, behavior: 'instant' }); 
+            } catch(e) {} 
+          });
+        }, 20); // Smooth scroll speed
+      }, 3000);
+    }
+  } else {
+    if (currentEdge) {
+      currentEdge = null;
+      clearTimeout(edgeScrollTimer);
+      clearInterval(edgeScrollInterval);
+    }
+  }
+}
+
+function handleProximitySnap() {
+  const gazeEls = document.querySelectorAll('.gaze-el');
+  let closestEl = null; let minDistance = 150;
+  gazeEls.forEach(el => {
+    if (el.getBoundingClientRect().width === 0) return;
+    const rect = el.getBoundingClientRect();
+    if (smoothedX >= rect.left && smoothedX <= rect.right && smoothedY >= rect.top && smoothedY <= rect.bottom) {
+      minDistance = -1; closestEl = el;
+    } else if (minDistance >= 0) {
+      const cx = rect.left + rect.width / 2;
+      const cy = rect.top + rect.height / 2;
+      const dist = Math.sqrt(Math.pow(cx - smoothedX, 2) + Math.pow(cy - smoothedY, 2));
+      if (dist < minDistance) { minDistance = dist; closestEl = el; }
+    }
+  });
+
+  if (closestEl) {
+    // We start gaze timer if tracking via face, or immediately if tracking via hand?
+    // Keep gaze timer same for Hand, but pinch bypasses it!
+    if (state.gazeTarget !== closestEl) startGaze(closestEl);
+    const rect = closestEl.getBoundingClientRect();
+    if (gazeCursor) {
+      gazeCursor.style.left = (rect.left + rect.width / 2) + 'px';
+      gazeCursor.style.top = (rect.top + rect.height / 2) + 'px';
+    }
+  } else {
+    if (state.gazeTarget) cancelGaze();
+  }
+}
 
 function initComputerVision() {
   if (cvInitialized) {
@@ -411,26 +484,91 @@ function initComputerVision() {
   if (!videoElement || !canvasElement) return;
   const canvasCtx = canvasElement.getContext('2d');
   
-  if (!window.FaceMesh) {
+  if (!window.FaceMesh || !window.Hands) {
     log('⚠️ MediaPipe not loaded from CDN yet. Retrying...', 'asr');
     setTimeout(initComputerVision, 1000);
     return;
   }
   
-  faceMesh = new FaceMesh({locateFile: (file) => {
-    return `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${file}`;
-  }});
+  // -- Setup Hands --
+  hands = new Hands({locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`});
+  hands.setOptions({
+    maxNumHands: 1,
+    modelComplexity: 1,
+    minDetectionConfidence: 0.5,
+    minTrackingConfidence: 0.5
+  });
   
+  hands.onResults((results) => {
+    if (state.mode !== 'motor' && state.mode !== 'cognitive') return;
+    
+    if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+      activeTrackingMode = 'hand';
+      const landmarks = results.multiHandLandmarks[0];
+      const indexFinger = landmarks[8];
+      const thumb = landmarks[4];
+      
+      const rawX = (indexFinger.x - 0.5) * POINTER_SENSITIVITY + 0.5;
+      const rawY = (indexFinger.y - 0.5) * POINTER_SENSITIVITY + 0.5;
+      
+      let targetX = (1 - rawX) * window.innerWidth;
+      let targetY = rawY * window.innerHeight;
+      targetX = Math.max(0, Math.min(window.innerWidth, targetX));
+      targetY = Math.max(0, Math.min(window.innerHeight, targetY));
+      
+      smoothedX = (targetX * EMA_ALPHA) + (smoothedX * (1 - EMA_ALPHA));
+      smoothedY = (targetY * EMA_ALPHA) + (smoothedY * (1 - EMA_ALPHA));
+      
+      handleEdgeScrolling(smoothedY);
+      
+      if (gazeCursor) {
+        gazeCursor.style.left = smoothedX + 'px';
+        gazeCursor.style.top = smoothedY + 'px';
+        gazeCursor.style.borderColor = '#eab308'; // Indicate Hand tracking actively overriding
+      }
+      
+      const dist = Math.sqrt(Math.pow(indexFinger.x - thumb.x, 2) + Math.pow(indexFinger.y - thumb.y, 2) + Math.pow(indexFinger.z - thumb.z, 2));
+      if (dist < 0.05 && !pinchLockout) {
+        pinchLockout = true;
+        if (state.gazeTarget) {
+          state.gazeTarget.click();
+          log('👆 Pinch Click Registered', 'action');
+          gazeCursor.classList.add('clicking');
+          setTimeout(() => gazeCursor.classList.remove('clicking'), 200);
+        }
+      } else if (dist > 0.08) {
+        pinchLockout = false;
+      }
+      
+      handleProximitySnap();
+      
+      // Draw Hand Landmarks
+      canvasCtx.save();
+      // We don't have HAND_CONNECTIONS defined globally, so we'll just draw dots for the joints to prevent errors
+      canvasCtx.fillStyle = '#eab308';
+      landmarks.forEach(l => {
+          canvasCtx.beginPath();
+          canvasCtx.arc(l.x * canvasElement.width, l.y * canvasElement.height, 3, 0, 2*Math.PI);
+          canvasCtx.fill();
+      });
+      canvasCtx.restore();
+    } else {
+      activeTrackingMode = 'face';
+      if (gazeCursor) gazeCursor.style.borderColor = '#4edea3';
+    }
+  });
+
+  // -- Setup FaceMesh --
+  faceMesh = new FaceMesh({locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${file}`});
   faceMesh.setOptions({
     maxNumFaces: 1,
-    refineLandmarks: true, // Gets Iris tracking landmarks
+    refineLandmarks: true,
     minDetectionConfidence: 0.5,
     minTrackingConfidence: 0.5
   });
   
   faceMesh.onResults((results) => {
     if (results.multiFaceLandmarks && results.multiFaceLandmarks.length > 0) {
-      // Passive Auto-Wake Engine
       if (state.mode === 'normal' && !touchActive) {
         if (!faceDwellStart) {
           faceDwellStart = Date.now();
@@ -443,83 +581,62 @@ function initComputerVision() {
         faceDwellStart = 0;
       }
       
-      if (state.mode !== 'motor') {
+      if (state.mode !== 'motor' && state.mode !== 'cognitive') {
         canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
         return;
       }
       
-      // Draw the cool matrix feedback
       canvasElement.width = videoElement.videoWidth;
       canvasElement.height = videoElement.videoHeight;
       canvasCtx.save();
       canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
       const landmarks = results.multiFaceLandmarks[0];
       
-      // Draw Face Mesh for visual proof
       drawConnectors(canvasCtx, landmarks, FACEMESH_TESSELATION, {color: '#00d4aa', lineWidth: 0.5});
       drawConnectors(canvasCtx, landmarks, FACEMESH_RIGHT_EYE, {color: '#6c63ff'});
       drawConnectors(canvasCtx, landmarks, FACEMESH_LEFT_EYE, {color: '#6c63ff'});
       drawConnectors(canvasCtx, landmarks, FACEMESH_RIGHT_IRIS, {color: '#ff3030'});
       drawConnectors(canvasCtx, landmarks, FACEMESH_LEFT_IRIS, {color: '#ff3030'});
       
-      // Node 1 is the tip of the nose
-      const nose = landmarks[1]; 
-      
-      const rawX = (nose.x - 0.5) * POINTER_SENSITIVITY + 0.5;
-      const rawY = (nose.y - 0.5) * POINTER_SENSITIVITY + 0.5;
-      
-      // Mirror the X coordinate since webcam is mirrored
-      let targetX = (1 - rawX) * window.innerWidth;
-      let targetY = rawY * window.innerHeight;
-      
-      // Clamp bounds
-      targetX = Math.max(0, Math.min(window.innerWidth, targetX));
-      targetY = Math.max(0, Math.min(window.innerHeight, targetY));
-      
-      smoothedX = (targetX * EMA_ALPHA) + (smoothedX * (1 - EMA_ALPHA));
-      smoothedY = (targetY * EMA_ALPHA) + (smoothedY * (1 - EMA_ALPHA));
-      
-      if (gazeCursor) {
-        gazeCursor.style.left = smoothedX + 'px';
-        gazeCursor.style.top = smoothedY + 'px';
-      }
-      
-      // Hitbox / Proximity Snap logic
-      const gazeEls = document.querySelectorAll('.gaze-el');
-      let closestEl = null; let minDistance = 150;
-      gazeEls.forEach(el => {
-        if (el.getBoundingClientRect().width === 0) return;
-        const rect = el.getBoundingClientRect();
-        if (smoothedX >= rect.left && smoothedX <= rect.right && smoothedY >= rect.top && smoothedY <= rect.bottom) {
-          minDistance = -1; closestEl = el;
-        } else if (minDistance >= 0) {
-          const cx = rect.left + rect.width / 2;
-          const cy = rect.top + rect.height / 2;
-          const dist = Math.sqrt(Math.pow(cx - smoothedX, 2) + Math.pow(cy - smoothedY, 2));
-          if (dist < minDistance) { minDistance = dist; closestEl = el; }
-        }
-      });
-      
-      if (closestEl) {
-        if (state.gazeTarget !== closestEl) startGaze(closestEl);
-        const rect = closestEl.getBoundingClientRect();
+      if (activeTrackingMode === 'face') {
+        const nose = landmarks[1]; 
+        const rawX = (nose.x - 0.5) * POINTER_SENSITIVITY + 0.5;
+        const rawY = (nose.y - 0.5) * POINTER_SENSITIVITY + 0.5;
+        
+        let targetX = (1 - rawX) * window.innerWidth;
+        let targetY = rawY * window.innerHeight;
+        
+        targetX = Math.max(0, Math.min(window.innerWidth, targetX));
+        targetY = Math.max(0, Math.min(window.innerHeight, targetY));
+        
+        smoothedX = (targetX * EMA_ALPHA) + (smoothedX * (1 - EMA_ALPHA));
+        smoothedY = (targetY * EMA_ALPHA) + (smoothedY * (1 - EMA_ALPHA));
+        
+        handleEdgeScrolling(smoothedY);
+        
         if (gazeCursor) {
-          gazeCursor.style.left = (rect.left + rect.width / 2) + 'px';
-          gazeCursor.style.top = (rect.top + rect.height / 2) + 'px';
+          gazeCursor.style.left = smoothedX + 'px';
+          gazeCursor.style.top = smoothedY + 'px';
         }
-      } else {
-        if (state.gazeTarget) cancelGaze();
+        handleProximitySnap();
       }
-      
     } else {
-      faceDwellStart = 0; // Reset auto-wake if face drops
-      if (state.gazeTarget) cancelGaze();
+      faceDwellStart = 0;
+      if (state.gazeTarget && activeTrackingMode === 'face') cancelGaze();
     }
     canvasCtx.restore();
   });
   
   camera = new Camera(videoElement, {
-    onFrame: async () => { await faceMesh.send({image: videoElement}); },
+    onFrame: async () => {
+      // Send frames to both models!
+      if (state.mode === 'motor' || state.mode === 'cognitive' || state.mode === 'normal') {
+        await faceMesh.send({image: videoElement});
+      }
+      if (state.mode === 'motor' || state.mode === 'cognitive') {
+        await hands.send({image: videoElement});
+      }
+    },
     width: 640,
     height: 480
   });
@@ -528,7 +645,7 @@ function initComputerVision() {
     const statusEl = document.querySelector('.cv-status');
     if (statusEl) statusEl.style.display = 'none';
     log('✅ Neural Network Active', 'gaze');
-    announce('Computer vision is now tracking your face.');
+    announce('Computer vision connected.');
   });
   
   cvInitialized = true;
